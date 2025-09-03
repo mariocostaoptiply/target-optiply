@@ -84,6 +84,26 @@ class TargetOptiply(TargetHotglue):
         
         return sink_map.get(stream_name, BaseOptiplySink)
 
+    def _simplify_records_dict(self, records_dict: dict) -> dict:
+        """Helper method to simplify records dictionary to show only counts."""
+        simplified_dict = {}
+        for stream_name, records in records_dict.items():
+            if isinstance(records, list):
+                # Count successes and failures
+                success_count = sum(1 for record in records if record.get("success", False))
+                fail_count = len(records) - success_count
+                
+                simplified_dict[stream_name] = {
+                    "total": len(records),
+                    "success": success_count,
+                    "failed": fail_count
+                }
+            else:
+                # Keep as is if not a list
+                simplified_dict[stream_name] = records
+        
+        return simplified_dict
+
     def get_state(self) -> dict:
         """Override to provide simplified state with only counts."""
         # Get the original state from parent
@@ -91,23 +111,7 @@ class TargetOptiply(TargetHotglue):
         
         # Simplify the bookmarks to only show counts
         if "bookmarks" in original_state:
-            simplified_bookmarks = {}
-            for stream_name, records in original_state["bookmarks"].items():
-                if isinstance(records, list):
-                    # Count successes and failures
-                    success_count = sum(1 for record in records if record.get("success", False))
-                    fail_count = len(records) - success_count
-                    
-                    simplified_bookmarks[stream_name] = {
-                        "total": len(records),
-                        "success": success_count,
-                        "failed": fail_count
-                    }
-                else:
-                    # Keep as is if not a list
-                    simplified_bookmarks[stream_name] = records
-            
-            original_state["bookmarks"] = simplified_bookmarks
+            original_state["bookmarks"] = self._simplify_records_dict(original_state["bookmarks"])
         
         return original_state
 
@@ -118,23 +122,7 @@ class TargetOptiply(TargetHotglue):
         
         # Simplify the export details to only show counts
         if "exportDetails" in original_summary:
-            simplified_details = {}
-            for stream_name, records in original_summary["exportDetails"].items():
-                if isinstance(records, list):
-                    # Count successes and failures
-                    success_count = sum(1 for record in records if record.get("success", False))
-                    fail_count = len(records) - success_count
-                    
-                    simplified_details[stream_name] = {
-                        "total": len(records),
-                        "success": success_count,
-                        "failed": fail_count
-                    }
-                else:
-                    # Keep as is if not a list
-                    simplified_details[stream_name] = records
-            
-            original_summary["exportDetails"] = simplified_details
+            original_summary["exportDetails"] = self._simplify_records_dict(original_summary["exportDetails"])
         
         return original_summary
 
@@ -144,23 +132,7 @@ class TargetOptiply(TargetHotglue):
         original_details = super()._get_export_details()
         
         # Simplify the export details to only show counts
-        simplified_details = {}
-        for stream_name, records in original_details.items():
-            if isinstance(records, list):
-                # Count successes and failures
-                success_count = sum(1 for record in records if record.get("success", False))
-                fail_count = len(records) - success_count
-                
-                simplified_details[stream_name] = {
-                    "total": len(records),
-                    "success": success_count,
-                    "failed": fail_count
-                }
-            else:
-                # Keep as is if not a list
-                simplified_details[stream_name] = records
-        
-        return simplified_details
+        return self._simplify_records_dict(original_details)
 
     def _get_metrics(self) -> dict:
         """Override to provide simplified metrics."""
@@ -169,23 +141,7 @@ class TargetOptiply(TargetHotglue):
         
         # Simplify the export details to only show counts
         if "exportDetails" in original_metrics:
-            simplified_details = {}
-            for stream_name, records in original_metrics["exportDetails"].items():
-                if isinstance(records, list):
-                    # Count successes and failures
-                    success_count = sum(1 for record in records if record.get("success", False))
-                    fail_count = len(records) - success_count
-                    
-                    simplified_details[stream_name] = {
-                        "total": len(records),
-                        "success": success_count,
-                        "failed": fail_count
-                    }
-                else:
-                    # Keep as is if not a list
-                    simplified_details[stream_name] = records
-            
-            original_metrics["exportDetails"] = simplified_details
+            original_metrics["exportDetails"] = self._simplify_records_dict(original_metrics["exportDetails"])
         
         return original_metrics
 

@@ -395,14 +395,19 @@ class SupplierProductSink(BaseOptiplySink):
                     self.logger.warning(f"Could not convert {field} to integer: {attributes[field]}")
                     attributes.pop(field, None)
         
-        # Convert double fields (weight, volume) and round to 2 decimal places
+        # Convert double fields (weight, volume) with appropriate precision
         double_fields = ["weight", "volume"]
         for field in double_fields:
             if field in attributes and attributes[field] is not None:
                 try:
                     value = float(attributes[field])
-                    # Round to 2 decimal places as per API spec
-                    attributes[field] = round(value, 2)
+                    # For very small values (< 0.001), preserve more precision
+                    if abs(value) < 0.001 and value != 0:
+                        # Use 6 decimal places for small values to preserve precision
+                        attributes[field] = round(value, 6)
+                    else:
+                        # Use 2 decimal places for larger values
+                        attributes[field] = round(value, 2)
                 except (ValueError, TypeError):
                     self.logger.warning(f"Could not convert {field} to float: {attributes[field]}")
                     attributes.pop(field, None)
