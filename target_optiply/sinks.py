@@ -118,11 +118,15 @@ class BaseOptiplySink(OptiplySink):
 
             # Handle response
             if response.status_code == 404:
-                error_msg = f"Record not found (404): {record_id}"
+                # Get meaningful error message from response
+                error_details = self._get_error_message_from_response(response.text, response.status_code)
+                error_msg = f"Record not found (404): {record_id} - {error_details}"
                 self.logger.warning(error_msg)
                 return None, False, state_updates
             elif response.status_code >= 400:
-                error_msg = f"Request failed with status {response.status_code}: {response.text}"
+                # Get meaningful error message from response
+                error_details = self._get_error_message_from_response(response.text, response.status_code)
+                error_msg = f"Request failed with status {response.status_code}: {error_details}"
                 self.logger.error(error_msg)
                 return None, False, state_updates
 
@@ -148,6 +152,41 @@ class BaseOptiplySink(OptiplySink):
             The field mappings dictionary.
         """
         return self.field_mappings
+
+    def _get_error_message_from_response(self, response_text: str, status_code: int) -> str:
+        """Get a meaningful error message from response text."""
+        if not response_text or response_text.strip() in ['', 'null', 'None']:
+            return f"No error details provided (status {status_code})"
+        
+        # Try to parse JSON error response
+        try:
+            import json
+            error_data = json.loads(response_text)
+            if isinstance(error_data, dict):
+                if 'errors' in error_data and isinstance(error_data['errors'], list):
+                    error_messages = []
+                    for error in error_data['errors']:
+                        if isinstance(error, dict):
+                            if 'meta' in error and 'message' in error['meta']:
+                                error_messages.append(error['meta']['message'])
+                            elif 'detail' in error:
+                                error_messages.append(error['detail'])
+                            elif 'message' in error:
+                                error_messages.append(error['message'])
+                    if error_messages:
+                        return f"API Error: {'; '.join(error_messages)}"
+                elif 'message' in error_data:
+                    return f"API Error: {error_data['message']}"
+                elif 'error' in error_data:
+                    return f"API Error: {error_data['error']}"
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+        
+        # Fallback to raw response text if it's meaningful
+        if len(response_text.strip()) > 0:
+            return f"API Error: {response_text}"
+        else:
+            return f"No error details provided (status {status_code})"
 
     def build_attributes(self, record: Dict, field_mappings: Dict[str, str]) -> Dict:
         """Build attributes dictionary from record using field mappings.

@@ -98,6 +98,41 @@ class OptiplySink(HotglueSink):
         })
         return headers
 
+    def _get_error_message(self, response_text: str, status_code: int, url: str) -> str:
+        """Get a meaningful error message from response text."""
+        if not response_text or response_text.strip() in ['', 'null', 'None']:
+            return f"No error details provided (status {status_code})"
+        
+        # Try to parse JSON error response
+        try:
+            import json
+            error_data = json.loads(response_text)
+            if isinstance(error_data, dict):
+                if 'errors' in error_data and isinstance(error_data['errors'], list):
+                    error_messages = []
+                    for error in error_data['errors']:
+                        if isinstance(error, dict):
+                            if 'meta' in error and 'message' in error['meta']:
+                                error_messages.append(error['meta']['message'])
+                            elif 'detail' in error:
+                                error_messages.append(error['detail'])
+                            elif 'message' in error:
+                                error_messages.append(error['message'])
+                    if error_messages:
+                        return f"API Error: {'; '.join(error_messages)}"
+                elif 'message' in error_data:
+                    return f"API Error: {error_data['message']}"
+                elif 'error' in error_data:
+                    return f"API Error: {error_data['error']}"
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+        
+        # Fallback to raw response text if it's meaningful
+        if len(response_text.strip()) > 0:
+            return f"API Error: {response_text}"
+        else:
+            return f"No error details provided (status {status_code})"
+
     def validate_response(self, response: requests.Response) -> None:
         """Validate the response from the API.
 
@@ -109,15 +144,19 @@ class OptiplySink(HotglueSink):
             RetriableAPIError: If the response indicates a retriable error.
         """
         if response.status_code >= 500:
-            raise RetriableAPIError(f"Server error: {response.text}")
+            error_msg = self._get_error_message(response.text, response.status_code, response.url)
+            raise RetriableAPIError(f"Server error ({response.status_code}): {error_msg}")
         elif response.status_code == 404:
-            logger.warning(f"Resource not found (404): {response.url}")
+            error_msg = self._get_error_message(response.text, response.status_code, response.url)
+            logger.warning(f"Resource not found (404): {response.url} - {error_msg}")
             return
         elif response.status_code == 401:
             # 401 errors are handled in _request method with token refresh
-            raise FatalAPIError(f"Authentication failed after token refresh: {response.text}")
+            error_msg = self._get_error_message(response.text, response.status_code, response.url)
+            raise FatalAPIError(f"Authentication failed after token refresh ({response.status_code}): {error_msg}")
         elif response.status_code >= 400:
-            raise FatalAPIError(f"Client error: {response.text}")
+            error_msg = self._get_error_message(response.text, response.status_code, response.url)
+            raise FatalAPIError(f"Client error ({response.status_code}): {error_msg}")
 
     @backoff.on_exception(
         backoff.expo,
@@ -224,7 +263,9 @@ class OptiplySink(HotglueSink):
             # Log response for debugging
             self.logger.info(f"Response status: {response.status_code}")
             if response.status_code >= 400:
-                self.logger.error(f"API Error: {response.status_code} - {response.text}")
+                # Use the same error message helper function
+                error_msg = self._get_error_message(response.text, response.status_code, url)
+                self.logger.error(f"API Error: {response.status_code} - {error_msg}")
                 # Log the request payload for server errors (500s)
                 if response.status_code >= 500:
                     self.logger.error(f"Request payload that caused 500 error: {request_data}")
