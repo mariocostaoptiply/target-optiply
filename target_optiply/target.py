@@ -1,13 +1,4 @@
 """Optiply target class."""
-
-from __future__ import annotations
-
-from singer_sdk import typing as th
-from singer_sdk.target_base import Target
-from typing import Dict, Any
-import json
-import os
-
 from target_optiply.sinks import (
     BaseOptiplySink,
     ProductsSink,
@@ -19,164 +10,140 @@ from target_optiply.sinks import (
     SellOrderLineSink,
 )
 
+from target_hotglue.target import TargetHotglue
+from typing import Callable, Dict, List, Optional, Tuple, Type, Union
+from pathlib import Path, PurePath
 
-class TargetOptiply(Target):
-    """Target for Optiply API."""
 
+class TargetOptiply(TargetHotglue):
+    """Target for Optiply."""
+
+    def __init__(
+        self,
+        config: Optional[Union[dict, PurePath, str, List[Union[PurePath, str]]]] = None,
+        parse_env_config: bool = False,
+        validate_config: bool = True,
+        state: str = None
+    ) -> None:
+        self.config_file = config[0]
+        self.logger.info(f"Target config file: {self.config_file}")
+        super().__init__(config, parse_env_config, validate_config)
+        
+        # Log the config structure after initialization
+        self.logger.info(f"Target config keys: {list(self._config.keys())}")
+        
+        # Log the access_token being used
+        if "access_token" in self._config:
+            access_token = self._config["access_token"]
+            # Log first few characters of token for security
+            if access_token and len(access_token) > 8:
+                masked_token = access_token[:4] + "*" * (len(access_token) - 8) + access_token[-4:]
+                self.logger.info(f"Using access_token: {masked_token}")
+            else:
+                self.logger.info(f"Using access_token: {access_token}")
+        else:
+            self.logger.warning("No access_token found in config")
+        
+        # Also check for "token" key for backward compatibility
+        if "token" in self._config:
+            token = self._config["token"]
+            # Log first few characters of token for security
+            if token and len(token) > 8:
+                masked_token = token[:4] + "*" * (len(token) - 8) + token[-4:]
+                self.logger.info(f"Using token: {masked_token}")
+            else:
+                self.logger.info(f"Using token: {token}")
+        else:
+            self.logger.info("No token key found in config (using access_token instead)")
+
+    SINK_TYPES = [
+        BaseOptiplySink,
+        ProductsSink,
+        SupplierSink,
+        SupplierProductSink,
+        BuyOrderSink,
+        BuyOrderLineSink,
+        SellOrderSink,
+        SellOrderLineSink,
+    ]
+    MAX_PARALLELISM = 10
     name = "target-optiply"
-
-    config_jsonschema = th.PropertiesList(
-        th.Property(
-            "username",
-            th.StringType,
-            description="Optiply API username",
-            required=True,
-        ),
-        th.Property(
-            "client_id",
-            th.StringType,
-            description="Optiply API client ID",
-            required=True,
-        ),
-        th.Property(
-            "client_secret",
-            th.StringType,
-            description="Optiply API client secret",
-            required=True,
-        ),
-        th.Property(
-            "password",
-            th.StringType,
-            description="Optiply API password",
-            required=True,
-        ),
-        th.Property(
-            "account_id",
-            th.IntegerType,
-            description="Optiply account ID",
-        ),
-        th.Property(
-            "coupling_id",
-            th.IntegerType,
-            description="Optiply coupling ID",
-        ),
-        th.Property(
-            "start_date",
-            th.StringType,
-            description="Start date for data sync",
-        ),
-        th.Property(
-            "hotglue_metadata",
-            th.ObjectType(
-                th.Property(
-                    "metadata",
-                    th.ObjectType(
-                        th.Property(
-                            "webshop_handle",
-                            th.StringType,
-                            description="Webshop handle",
-                        ),
-                    ),
-                ),
-            ),
-            description="Hotglue metadata",
-        ),
-    ).to_dict()
 
     def get_sink_class(self, stream_name: str):
         """Get sink class for the given stream name."""
-        if stream_name == "BuyOrders":
-            return BuyOrderSink
-        elif stream_name == "Products":
-            return ProductsSink
-        elif stream_name == "Suppliers":
-            return SupplierSink
-        elif stream_name == "SupplierProducts":
-            return SupplierProductSink
-        elif stream_name == "BuyOrderLines":
-            return BuyOrderLineSink
-        elif stream_name == "SellOrders":
-            return SellOrderSink
-        elif stream_name == "SellOrderLines":
-            return SellOrderLineSink
-        else:
-            # Return base sink for unknown streams
-            return BaseOptiplySink
-
-    def process_batch(self, context: Dict) -> None:
-        """Process a batch of records."""
-        for stream_name, stream in self.streams.items():
-            if stream_name in self.sinks:
-                sink = self.sinks[stream_name]
-                for record in stream.records:
-                    sink.process_record(record, context)
-
-        # Generate detailed summary
-        self.logger.info("\n=== Processing Summary ===")
-        total_success = 0
-        total_failure = 0
-        export_summary = {}
-        export_details = {}
-        
-        for stream_name, sink in self.sinks.items():
-            stats = sink.get_stats()
-            self.logger.info(f"\n{stream_name}:")
-            self.logger.info(f"  Successfully processed: {stats['success']}")
-            self.logger.info(f"  Failed records: {stats['failure']}")
-            self.logger.info(f"  Total records: {stats['total']}")
-            
-            # Add to totals
-            total_success += stats['success']
-            total_failure += stats['failure']
-            
-            # Add to export summary
-            export_summary[stream_name] = {
-                "success": stats['success'],
-                "fail": stats['failure'],
-                "existing": 0,  # Not tracked in current implementation
-                "updated": 0    # Not tracked in current implementation
-            }
-            
-            # Add to export details
-            export_details[stream_name] = stats['processed_records']
-        
-        self.logger.info("\nOverall Summary:")
-        self.logger.info(f"  Total successfully processed: {total_success}")
-        self.logger.info(f"  Total failed records: {total_failure}")
-        self.logger.info(f"  Total records processed: {total_success + total_failure}")
-        self.logger.info("======================\n")
-
-        # Create state with job results
-        state = {
-            "bookmarks": export_details,
-            "summary": export_summary
+        # Map stream names to sink classes
+        sink_map = {
+            "BuyOrders": BuyOrderSink,
+            "Products": ProductsSink,
+            "Suppliers": SupplierSink,
+            "SupplierProducts": SupplierProductSink,
+            "BuyOrderLines": BuyOrderLineSink,
+            "SellOrders": SellOrderSink,
+            "SellOrderLines": SellOrderLineSink,
         }
         
-        # Save state to target_state.json (Hotglue-style)
-        state_file = os.path.join(os.getcwd(), "target-state.json")
-        with open(state_file, 'w') as f:
-            json.dump(state, f, indent=2)
-        
-        # Emit state message to stdout (Singer protocol)
-        self.state = state
-        self._write_state_message()
-        
-        # Update job-details.json if it exists
-        job_details_file = os.path.join(os.getcwd(), "job-details.json")
-        if os.path.exists(job_details_file):
-            with open(job_details_file, 'r') as f:
-                job_details = json.load(f)
-            
-            # Update metrics
-            if isinstance(job_details, list) and len(job_details) > 0:
-                job_details[0]["metrics"] = {
-                    "recordCount": {},
-                    "exportSummary": export_summary,
-                    "exportDetails": export_details
-                }
+        return sink_map.get(stream_name, BaseOptiplySink)
+
+    def _simplify_records_dict(self, records_dict: dict) -> dict:
+        """Helper method to simplify records dictionary to show only counts."""
+        simplified_dict = {}
+        for stream_name, records in records_dict.items():
+            if isinstance(records, list):
+                # Count successes and failures
+                success_count = sum(1 for record in records if record.get("success", False))
+                fail_count = len(records) - success_count
                 
-                with open(job_details_file, 'w') as f:
-                    json.dump(job_details, f, indent=2)
+                simplified_dict[stream_name] = {
+                    "total": len(records),
+                    "success": success_count,
+                    "failed": fail_count
+                }
+            else:
+                # Keep as is if not a list
+                simplified_dict[stream_name] = records
+        
+        return simplified_dict
+
+    def get_state(self) -> dict:
+        """Override to provide simplified state with only counts."""
+        # Get the original state from parent
+        original_state = super().get_state()
+        
+        # Simplify the bookmarks to only show counts
+        if "bookmarks" in original_state:
+            original_state["bookmarks"] = self._simplify_records_dict(original_state["bookmarks"])
+        
+        return original_state
+
+    def _get_export_summary(self) -> dict:
+        """Override to provide simplified export summary."""
+        # Get the original export summary from parent
+        original_summary = super()._get_export_summary()
+        
+        # Simplify the export details to only show counts
+        if "exportDetails" in original_summary:
+            original_summary["exportDetails"] = self._simplify_records_dict(original_summary["exportDetails"])
+        
+        return original_summary
+
+    def _get_export_details(self) -> dict:
+        """Override to provide simplified export details."""
+        # Get the original export details from parent
+        original_details = super()._get_export_details()
+        
+        # Simplify the export details to only show counts
+        return self._simplify_records_dict(original_details)
+
+    def _get_metrics(self) -> dict:
+        """Override to provide simplified metrics."""
+        # Get the original metrics from parent
+        original_metrics = super()._get_metrics()
+        
+        # Simplify the export details to only show counts
+        if "exportDetails" in original_metrics:
+            original_metrics["exportDetails"] = self._simplify_records_dict(original_metrics["exportDetails"])
+        
+        return original_metrics
 
 
 if __name__ == "__main__":

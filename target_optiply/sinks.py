@@ -12,8 +12,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from singer_sdk.exceptions import FatalAPIError, RetriableAPIError
-from singer_sdk.sinks import RecordSink
-import singer_sdk.typing as th
+from target_hotglue.client import HotglueSink
+from singer_sdk.plugin_base import PluginBase
 
 from target_optiply.auth import OptiplyAuthenticator
 from target_optiply.client import OptiplySink
@@ -36,57 +36,114 @@ class BaseOptiplySink(OptiplySink):
     field_mappings = {}
     _processed_records = []
 
-    def __init__(self, target: str, stream_name: str, schema: Dict, key_properties: List[str]):
+    def __init__(self, target: PluginBase, stream_name: str, schema: Dict, key_properties: List[str]):
         super().__init__(target, stream_name, schema, key_properties)
         self.endpoint = self.stream_name.lower() if not self.endpoint else self.endpoint
         self._processed_records = []
 
-    @property
-    def success_count(self) -> int:
-        """Get the number of successfully processed records."""
-        return sum(1 for record in self._processed_records if record.get('success', False))
+    def preprocess_record(self, record: dict, context: dict) -> dict:
+        """Preprocess the record before sending to API."""
+        # Build attributes using field mappings
+        attributes = self.build_attributes(record, self.get_field_mappings())
 
-    @property
-    def failure_count(self) -> int:
-        """Get the number of failed records."""
-        return sum(1 for record in self._processed_records if not record.get('success', False))
+        # Add any additional attributes from the record
+        self._add_additional_attributes(record, attributes)
 
-    def get_url(
-        self,
-        context: Optional[dict] = None,
-    ) -> str:
-        """Get the stream's API URL."""
-        endpoint = self.endpoint
-        record = context.get("record", {}) if context else {}
+        payload = {
+            "data": {
+                "type": self.endpoint,
+                "attributes": attributes
+            }
+        }
         
-        # Construct the base URL with endpoint
-        if context and context.get("http_method") == "PATCH" and "id" in record:
-            url = f"{self.base_url}/{endpoint}/{record['id']}"
-        else:
-            url = f"{self.base_url}/{endpoint}"
+        # Add ID for PATCH requests
+        if "id" in record:
+            payload["data"]["id"] = record["id"]
+            
+        return payload
 
-        # Add query parameters
-        query_params = {}
+    def upsert_record(self, record: dict, context: dict) -> tuple:
+        """Process the record and return (id, success, state_updates)."""
+        state_updates = {}
         
-        # Add account and coupling IDs if they exist in config
-        if hasattr(self, 'config'):
-            if 'account_id' in self.config:
-                query_params['accountId'] = self.config['account_id']
-            if 'coupling_id' in self.config:
-                query_params['couplingId'] = self.config['coupling_id']
+        try:
+            # Get the ID from the preprocessed record structure
+            record_id = None
+            if 'data' in record and 'id' in record['data']:
+                record_id = record['data']['id']
+            elif 'id' in record:
+                record_id = record['id']
+            
+            # Set http_method based on presence of id field
+            http_method = "PATCH" if record_id else "POST"
+            
+            # Log record processing
+            self.logger.info(f"Processing record for {self.stream_name} (ID: {record_id})")
 
-        # Add any additional query parameters from the original URL
-        url_parts = self.url().split('?')
-        if len(url_parts) > 1:
-            additional_params = dict(param.split('=') for param in url_parts[1].split('&'))
-            query_params.update(additional_params)
+            # For POST requests, check mandatory fields
+            if http_method == "POST":
+                mandatory_fields = self.get_mandatory_fields()
+                missing_fields = []
+                
+                # Get the actual record data - it might be nested in data.attributes
+                actual_record = record
+                if 'data' in record and 'attributes' in record['data']:
+                    actual_record = record['data']['attributes']
+                
+                for field in mandatory_fields:
+                    if field not in actual_record or actual_record[field] is None or (isinstance(actual_record[field], str) and not actual_record[field].strip()):
+                        missing_fields.append(field)
+                if missing_fields:
+                    error_msg = f"Record skipped due to missing mandatory fields: {', '.join(missing_fields)}"
+                    self.logger.error(error_msg)
+                    return None, False, state_updates
 
-        # Construct final URL with query parameters
-        if query_params:
-            query_string = "&".join(f"{k}={v}" for k, v in query_params.items())
-            url = f"{url}?{query_string}"
+            # Get the URL for the request
+            if record_id:
+                endpoint = f"{self.endpoint}/{record_id}"
+            else:
+                endpoint = self.endpoint
+                
+            self.logger.info(f"Making {http_method} request to: {endpoint}")
 
-        return url
+            # Make the request
+            response = self.request_api(
+                http_method=http_method,
+                endpoint=endpoint,
+                request_data=record
+            )
+            
+            self.logger.info(f"Response status: {response.status_code}")
+            self.logger.info(f"Response body: {response.text}")
+
+            # Handle response
+            if response.status_code == 404:
+                # Get meaningful error message from response
+                error_details = self._get_error_message_from_response(response.text, response.status_code)
+                error_msg = f"Record not found (404): {record_id} - {error_details}"
+                self.logger.warning(error_msg)
+                return None, False, state_updates
+            elif response.status_code >= 400:
+                # Get meaningful error message from response
+                error_details = self._get_error_message_from_response(response.text, response.status_code)
+                error_msg = f"Request failed with status {response.status_code}: {error_details}"
+                self.logger.error(error_msg)
+                return None, False, state_updates
+
+            # Parse response to get ID
+            response_data = response.json()
+            if "data" in response_data and "id" in response_data["data"]:
+                response_record_id = response_data["data"]["id"]
+            else:
+                response_record_id = record_id or "unknown"
+
+            self.logger.info(f"{self.stream_name} processed with id: {response_record_id}")
+            return response_record_id, True, state_updates
+
+        except Exception as e:
+            error_msg = f"Error processing record: {str(e)}"
+            self.logger.error(error_msg)
+            return None, False, state_updates
 
     def get_field_mappings(self) -> Dict[str, str]:
         """Get the field mappings for this sink.
@@ -95,6 +152,41 @@ class BaseOptiplySink(OptiplySink):
             The field mappings dictionary.
         """
         return self.field_mappings
+
+    def _get_error_message_from_response(self, response_text: str, status_code: int) -> str:
+        """Get a meaningful error message from response text."""
+        if not response_text or response_text.strip() in ['', 'null', 'None']:
+            return f"No error details provided (status {status_code})"
+        
+        # Try to parse JSON error response
+        try:
+            import json
+            error_data = json.loads(response_text)
+            if isinstance(error_data, dict):
+                if 'errors' in error_data and isinstance(error_data['errors'], list):
+                    error_messages = []
+                    for error in error_data['errors']:
+                        if isinstance(error, dict):
+                            if 'meta' in error and 'message' in error['meta']:
+                                error_messages.append(error['meta']['message'])
+                            elif 'detail' in error:
+                                error_messages.append(error['detail'])
+                            elif 'message' in error:
+                                error_messages.append(error['message'])
+                    if error_messages:
+                        return f"API Error: {'; '.join(error_messages)}"
+                elif 'message' in error_data:
+                    return f"API Error: {error_data['message']}"
+                elif 'error' in error_data:
+                    return f"API Error: {error_data['error']}"
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+        
+        # Fallback to raw response text if it's meaningful
+        if len(response_text.strip()) > 0:
+            return f"API Error: {response_text}"
+        else:
+            return f"No error details provided (status {status_code})"
 
     def build_attributes(self, record: Dict, field_mappings: Dict[str, str]) -> Dict:
         """Build attributes dictionary from record using field mappings.
@@ -119,35 +211,6 @@ class BaseOptiplySink(OptiplySink):
                     value = float(value)
                 attributes[api_field] = value
         return attributes
-
-    def _prepare_payload(
-        self,
-        context: Optional[dict] = None,
-        record: Optional[dict] = None,
-    ) -> dict:
-        """Prepare the payload for the API request."""
-        self.logger.info(f"Preparing payload for {self.stream_name}")
-        self.logger.info(f"Context: {context}")
-        self.logger.info(f"Record: {record}")
-
-        # Get the HTTP method from context
-        http_method = context.get("http_method", "POST")
-        self.logger.info(f"HTTP Method from context: {http_method}")
-
-        # Build attributes using field mappings
-        attributes = self.build_attributes(record, self.get_field_mappings())
-
-        # Add any additional attributes from the record
-        self._add_additional_attributes(record, attributes)
-
-        payload = {
-            "data": {
-                "type": self.endpoint,
-                "attributes": attributes
-            }
-        }
-        self.logger.info(f"Final payload: {json.dumps(payload, indent=2)}")
-        return payload
 
     def _add_additional_attributes(self, record: Dict, attributes: Dict) -> None:
         """Add any additional attributes that are not covered by field mappings.
@@ -212,168 +275,19 @@ class BaseOptiplySink(OptiplySink):
         # Remove remoteDataSyncedToDate as it's not accepted by the API
         attributes.pop("remoteDataSyncedToDate", None)
 
-    def process_record(self, record: Dict, context: Dict = None) -> None:
-        """Process a record."""
-        try:
-            # Create context if not provided
-            if context is None:
-                context = {}
-
-            # Set http_method based on presence of id field
-            http_method = "PATCH" if "id" in record else "POST"
-            context["http_method"] = http_method
-            context["record"] = record  # Add record to context for URL construction
-            
-            # Log record processing
-            self.logger.info(f"Processing record for {self.stream_name} (ID: {record.get('id')})")
-
-            # For POST requests, check mandatory fields
-            if http_method == "POST":
-                mandatory_fields = self.get_mandatory_fields()
-                missing_fields = []
-                for field in mandatory_fields:
-                    if field not in record or record[field] is None or (isinstance(record[field], str) and not record[field].strip()):
-                        missing_fields.append(field)
-                if missing_fields:
-                    error_msg = f"Record skipped due to missing mandatory fields: {', '.join(missing_fields)}"
-                    self.logger.error(error_msg)
-                    self._processed_records.append({
-                        "hash": self._generate_record_hash(record),
-                        "success": False,
-                        "id": record.get('id'),
-                        "externalId": record.get('externalId'),
-                        "error": error_msg
-                    })
-                    return None
-
-            # Prepare the payload
-            payload = self._prepare_payload(context, record)
-            if not payload:
-                error_msg = "Failed to prepare payload"
-                self.logger.error(error_msg)
-                self._processed_records.append({
-                    "hash": self._generate_record_hash(record),
-                    "success": False,
-                    "id": record.get('id'),
-                    "externalId": record.get('externalId'),
-                    "error": error_msg
-                })
-                return
-
-            # Get the URL for the request
-            url = self.get_url(context)
-            self.logger.info(f"Making {http_method} request to: {url}")
-
-            # Make the request using the _request method to handle 401 errors with token refresh
-            # Construct the endpoint properly for the _request method
-            if record.get('id'):
-                endpoint = f"{self.endpoint}/{record.get('id')}"
-            else:
-                endpoint = self.endpoint
-                
-            response = self._request(
-                http_method=http_method,
-                endpoint=endpoint,
-                request_data=payload
-            )
-            self.logger.info(f"Response status: {response.status_code}")
-            self.logger.info(f"Response body: {response.text}")
-
-            # Validate the response
-            if response.status_code == 404:
-                error_msg = f"Record not found (404): {record.get('id')}"
-                self.logger.warning(error_msg)
-                self._processed_records.append({
-                    "hash": self._generate_record_hash(record),
-                    "success": False,
-                    "id": record.get('id'),
-                    "externalId": record.get('externalId'),
-                    "error": error_msg
-                })
-                return
-            elif response.status_code >= 400:
-                error_msg = f"Request failed with status {response.status_code}: {response.text}"
-                self.logger.error(error_msg)
-                self._processed_records.append({
-                    "hash": self._generate_record_hash(record),
-                    "success": False,
-                    "id": record.get('id'),
-                    "externalId": record.get('externalId'),
-                    "error": error_msg
-                })
-                return
-
-            # If we get here, the record was processed successfully
-            self._processed_records.append({
-                "hash": self._generate_record_hash(record),
-                "success": True,
-                "id": record.get('id'),
-                "externalId": record.get('externalId')
-            })
-
-        except Exception as e:
-            error_msg = f"Error processing record: {str(e)}"
-            self.logger.error(error_msg)
-            self._processed_records.append({
-                "hash": self._generate_record_hash(record),
-                "success": False,
-                "id": record.get('id'),
-                "externalId": record.get('externalId'),
-                "error": error_msg
-            })
-
-    def _generate_record_hash(self, record: Dict) -> str:
-        """Generate a hash for the record to track its state.
-        
-        Args:
-            record: The record to generate a hash for.
-            
-        Returns:
-            A hash string representing the record's state.
-        """
-        import hashlib
-        from datetime import datetime
-        from decimal import Decimal
-        
-        # Create a serializable copy of the record
-        serializable_record = {}
-        for key, value in record.items():
-            if isinstance(value, datetime):
-                serializable_record[key] = value.isoformat()
-            elif isinstance(value, Decimal):
-                serializable_record[key] = float(value)
-            else:
-                serializable_record[key] = value
-        
-        # Create a string representation of the record's key fields
-        key_fields = sorted(serializable_record.items())
-        record_str = json.dumps(key_fields, sort_keys=True)
-        # Generate SHA-256 hash
-        return hashlib.sha256(record_str.encode()).hexdigest()
-
     def get_mandatory_fields(self) -> List[str]:
         """Get the list of mandatory fields for this sink."""
         return []
 
-    def get_stats(self) -> Dict[str, Any]:
-        """Get statistics about processed records.
-
-        Returns:
-            Dictionary containing success, failure counts, and processed records details.
-        """
-        success_count = self.success_count
-        failure_count = self.failure_count
-        return {
-            "success": success_count,
-            "failure": failure_count,
-            "total": success_count + failure_count,
-            "processed_records": self._processed_records
-        }
 
 class ProductsSink(BaseOptiplySink):
     """Products sink class."""
 
     endpoint = "products"
+    
+    @property
+    def name(self) -> str:
+        return "Products"
     field_mappings = {
         "name": "name",
         "skuCode": "skuCode",
@@ -394,12 +308,6 @@ class ProductsSink(BaseOptiplySink):
         "stockMeasurementUnit": "stockMeasurementUnit"
     }
 
-    def __init__(self, target: Any, stream_name: str, schema: Dict, key_properties: List[str]):
-        """Initialize the sink."""
-        super().__init__(target, stream_name, schema, key_properties)
-        # Override key_properties to make id optional for creation
-        self._key_properties = []
-
     def get_mandatory_fields(self) -> List[str]:
         """Get the list of mandatory fields for this sink.
 
@@ -408,20 +316,15 @@ class ProductsSink(BaseOptiplySink):
         """
         return ["name", "stockLevel", "unlimitedStock"]
 
-    def _add_additional_attributes(self, record: Dict, attributes: Dict) -> None:
-        """Add any additional attributes that are not covered by field mappings.
-        
-        This method can be overridden by subclasses to add custom attributes.
-        
-        Args:
-            record: The record to transform
-            attributes: The attributes dictionary to update
-        """
 
 class SupplierSink(BaseOptiplySink):
     """Optiply target sink class for suppliers."""
 
     endpoint = "suppliers"
+    
+    @property
+    def name(self) -> str:
+        return "Suppliers"
     field_mappings = {
         "name": "name",
         "emails": "emails",
@@ -450,73 +353,15 @@ class SupplierSink(BaseOptiplySink):
         """
         return ["name"]
 
-    def _add_additional_attributes(self, record: Dict, attributes: Dict) -> None:
-        """Add any additional attributes that are not covered by field mappings.
-        
-        This method can be overridden by subclasses to add custom attributes.
-        
-        Args:
-            record: The record to transform
-            attributes: The attributes dictionary to update
-        """
-        # Handle emails field - convert from JSON string to array if present
-        if "emails" in record and record["emails"] is not None:
-            try:
-                attributes["emails"] = json.loads(record["emails"])
-            except json.JSONDecodeError:
-                self.logger.warning(f"Could not parse emails JSON string: {record['emails']}")
-                attributes["emails"] = []
-
-        # Fields that should be integers
-        integer_fields = [
-            "deliveryTime",
-            "userReplenishmentPeriod",
-            "lostSalesReaction",
-            "lostSalesMovReaction",
-            "backorderThreshold",
-            "backordersReaction",
-            "maxLoadCapacity",
-            "containerVolume"
-        ]
-        for field in integer_fields:
-            if field in record and record[field] is not None:
-                try:
-                    # First convert to float to handle decimal strings, then to int
-                    attributes[field] = int(float(record[field]))
-                except (ValueError, TypeError):
-                    self.logger.warning(f"Could not convert {field} to integer: {record[field]}")
-                    attributes.pop(field, None)
-
-        # Fields that should be floats
-        float_fields = [
-            "minimumOrderValue",
-            "fixedCosts"
-        ]
-        for field in float_fields:
-            if field in record and record[field] is not None:
-                try:
-                    attributes[field] = float(record[field])
-                except (ValueError, TypeError):
-                    self.logger.warning(f"Could not convert {field} to float: {record[field]}")
-                    attributes.pop(field, None)
-
-        # Validate type field
-        if "type" in record and record["type"] not in ["vendor", "producer"]:
-            self.logger.warning(f"Invalid type value: {record['type']}. Must be 'vendor' or 'producer'")
-            attributes["type"] = "vendor"  # Default to vendor if invalid
-
-        # Validate globalLocationNumber length
-        if "globalLocationNumber" in record and len(record["globalLocationNumber"]) != 13:
-            self.logger.warning(f"Invalid globalLocationNumber length: {len(record['globalLocationNumber'])}. Must be 13 characters")
-            attributes.pop("globalLocationNumber", None)  # Remove if invalid
-
-        # Remove remoteDataSyncedToDate as it's not accepted by the API
-        attributes.pop("remoteDataSyncedToDate", None)
 
 class SupplierProductSink(BaseOptiplySink):
     """Optiply target sink class for supplier products."""
 
     endpoint = "supplierProducts"
+    
+    @property
+    def name(self) -> str:
+        return "SupplierProducts"
     field_mappings = {
         "name": "name",
         "skuCode": "skuCode",
@@ -537,6 +382,92 @@ class SupplierProductSink(BaseOptiplySink):
         "volume": "volume"
     }
 
+    def _add_additional_attributes(self, record: Dict, attributes: Dict) -> None:
+        """Add any additional attributes with proper data type conversion."""
+        super()._add_additional_attributes(record, attributes)
+        
+        # Convert price to float and round to 2 decimal places
+        if "price" in attributes and attributes["price"] is not None:
+            try:
+                price = float(attributes["price"])
+                # Round to 2 decimal places as per API spec
+                attributes["price"] = round(price, 2)
+            except (ValueError, TypeError):
+                self.logger.warning(f"Could not convert price to float: {attributes['price']}")
+                attributes.pop("price", None)
+        
+        # Convert boolean fields
+        boolean_fields = ["availability", "preferred"]
+        for field in boolean_fields:
+            if field in attributes and attributes[field] is not None:
+                value = attributes[field]
+                if isinstance(value, str):
+                    if value.lower() in ['true', '1', 'yes']:
+                        attributes[field] = True
+                    elif value.lower() in ['false', '0', 'no']:
+                        attributes[field] = False
+                    else:
+                        self.logger.warning(f"Could not convert {field} to boolean: {value}")
+                        attributes.pop(field, None)
+        
+        # Convert integer fields with validation
+        integer_fields = ["productId", "supplierId", "deliveryTime", "freeStock"]
+        for field in integer_fields:
+            if field in attributes and attributes[field] is not None:
+                try:
+                    attributes[field] = int(float(attributes[field]))
+                except (ValueError, TypeError):
+                    self.logger.warning(f"Could not convert {field} to integer: {attributes[field]}")
+                    attributes.pop(field, None)
+        
+        # Convert and validate minimumPurchaseQuantity and lotSize (must be >= 1)
+        for field in ["minimumPurchaseQuantity", "lotSize"]:
+            if field in attributes and attributes[field] is not None:
+                try:
+                    value = int(float(attributes[field]))
+                    if value >= 1:
+                        attributes[field] = value
+                    else:
+                        self.logger.warning(f"{field} must be >= 1, got: {value}")
+                        attributes.pop(field, None)
+                except (ValueError, TypeError):
+                    self.logger.warning(f"Could not convert {field} to integer: {attributes[field]}")
+                    attributes.pop(field, None)
+        
+        # Convert double fields (weight, volume) with appropriate precision
+        double_fields = ["weight", "volume"]
+        for field in double_fields:
+            if field in attributes and attributes[field] is not None:
+                try:
+                    value = float(attributes[field])
+                    # For very small values (< 0.001), preserve more precision
+                    if abs(value) < 0.001 and value != 0:
+                        # Use 6 decimal places for small values to preserve precision
+                        attributes[field] = round(value, 6)
+                    else:
+                        # Use 2 decimal places for larger values
+                        attributes[field] = round(value, 2)
+                except (ValueError, TypeError):
+                    self.logger.warning(f"Could not convert {field} to float: {attributes[field]}")
+                    attributes.pop(field, None)
+        
+        # Validate and normalize status field (should be lowercase per API spec)
+        if "status" in attributes and attributes["status"] is not None:
+            status = attributes["status"].lower()
+            if status in ["enabled", "active", "true", "1"]:
+                attributes["status"] = "enabled"
+            elif status in ["disabled", "inactive", "false", "0"]:
+                attributes["status"] = "disabled"
+            else:
+                self.logger.warning(f"Invalid status value: {attributes['status']}. Must be 'enabled' or 'disabled'")
+                attributes["status"] = "enabled"  # Default to enabled
+        
+        # Remove any None values that might cause issues
+        attributes = {k: v for k, v in attributes.items() if v is not None}
+        
+        # Log the final attributes for debugging
+        self.logger.info(f"Final attributes for {self.stream_name}: {attributes}")
+
     def get_mandatory_fields(self) -> List[str]:
         """Get the list of mandatory fields for this sink.
 
@@ -545,10 +476,15 @@ class SupplierProductSink(BaseOptiplySink):
         """
         return ["name", "productId", "supplierId"]
 
+
 class BuyOrderSink(BaseOptiplySink):
     """Optiply target sink class for buy orders."""
 
     endpoint = "buyOrders"
+    
+    @property
+    def name(self) -> str:
+        return "BuyOrders"
     field_mappings = {
         "placed": "placed",
         "completed": "completed",
@@ -595,10 +531,15 @@ class BuyOrderSink(BaseOptiplySink):
             attributes["totalValue"] = str(total_value)
             attributes["orderLines"] = buy_order_lines
 
+
 class BuyOrderLineSink(BaseOptiplySink):
     """Optiply target sink class for buy order lines."""
 
     endpoint = "buyOrderLines"
+    
+    @property
+    def name(self) -> str:
+        return "BuyOrderLines"
     field_mappings = {
         "quantity": "quantity",
         "subtotalValue": "subtotalValue",
@@ -615,10 +556,15 @@ class BuyOrderLineSink(BaseOptiplySink):
         """
         return ["subtotalValue", "productId", "quantity", "buyOrderId"]
 
+
 class SellOrderSink(BaseOptiplySink):
     """Optiply target sink class for sell orders."""
 
     endpoint = "sellOrders"
+    
+    @property
+    def name(self) -> str:
+        return "SellOrders"
     field_mappings = {
         "placed": "placed",
         "totalValue": "totalValue"
@@ -659,10 +605,15 @@ class SellOrderSink(BaseOptiplySink):
             attributes["totalValue"] = str(total_value)
             attributes["orderLines"] = sell_order_lines
 
+
 class SellOrderLineSink(BaseOptiplySink):
     """Optiply target sink class for sell order lines."""
 
     endpoint = "sellOrderLines"
+    
+    @property
+    def name(self) -> str:
+        return "SellOrderLines"
     field_mappings = {
         "quantity": "quantity",
         "subtotalValue": "subtotalValue",

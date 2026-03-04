@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "target-optiply"
 version = "0.0.1"
-description = "`target-optiply` is a Singer target for Optiply, built with the Meltano Singer SDK."
+description = "`target-optiply` is a Singer target for Optiply, built with the Hotglue Singer SDK."
 readme = "README.md"
 authors = ["Eduardo Sequeira <eduardosequeira@optiply.nl>"]
 keywords = [
@@ -12,9 +12,9 @@ license = "Apache-2.0"
 
 [tool.poetry.dependencies]
 python = "<3.12,>=3.7.1"
-singer-sdk = "^0.34.0"
+target-hotglue = "^0.0.16"
 requests = "^2.31.0"
-backoff = "^2.2.1"
+backoff = ">=1.8.0,<2.0"
 python-dateutil = "^2.8.2"
 
 [tool.poetry.dev-dependencies]

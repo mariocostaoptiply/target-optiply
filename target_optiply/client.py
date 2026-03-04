@@ -10,8 +10,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 import requests
 from singer_sdk.exceptions import FatalAPIError, RetriableAPIError
-
-from singer_sdk.sinks import RecordSink
+from target_hotglue.client import HotglueSink
+from singer_sdk.plugin_base import PluginBase
 
 from target_optiply.auth import OptiplyAuthenticator
 
@@ -26,14 +26,13 @@ class DateTimeEncoder(json.JSONEncoder):
             return obj.isoformat()
         return super().default(obj)
 
-class OptiplySink(RecordSink):
+class OptiplySink(HotglueSink):
     """Optiply target sink class."""
-
-    base_url = os.environ.get("optiply_base_url", "https://api.optiply.com/v1")
+    base_url = os.environ.get("optiply_base_url", "https://api.acceptance.optiply.com/v1")
 
     def __init__(
         self,
-        target: Any,
+        target: PluginBase,
         stream_name: str,
         schema: Dict,
         key_properties: Optional[List[str]] = None,
@@ -46,6 +45,7 @@ class OptiplySink(RecordSink):
             schema: The schema for the stream.
             key_properties: The key properties for the stream.
         """
+        self._target = target
         super().__init__(target, stream_name, schema, key_properties)
         self._authenticator = None
         self._session = None
@@ -60,7 +60,28 @@ class OptiplySink(RecordSink):
             The authenticator instance.
         """
         if self._authenticator is None:
-            self._authenticator = OptiplyAuthenticator(self.config)
+            # Get the config from target
+            full_config = self._target._config
+            self.logger.info(f"Full config keys: {list(full_config.keys())}")
+            self.logger.info(f"Full config type: {type(full_config)}")
+            
+            # Use top-level config for authentication
+            auth_config = {
+                "client_id": full_config.get("client_id"),
+                "client_secret": full_config.get("client_secret"),
+                "username": full_config.get("username"),
+                "password": full_config.get("password"),
+                "access_token": full_config.get("access_token")
+            }
+            self.logger.info("✅ USING top-level config for authentication")
+            
+            # Log the final auth config being used
+            self.logger.info(f"Final auth config keys: {list(auth_config.keys())}")
+            self.logger.info(f"Final auth config client_id: {auth_config.get('client_id', 'NOT_FOUND')}")
+            self.logger.info(f"Final auth config client_secret: {auth_config.get('client_secret', 'NOT_FOUND')[:8]}...{auth_config.get('client_secret', 'NOT_FOUND')[-4:] if len(auth_config.get('client_secret', '')) > 12 else '***'}")
+            
+            # Pass the target to the authenticator
+            self._authenticator = OptiplyAuthenticator(self._target)
         return self._authenticator
 
     def http_headers(self) -> Dict[str, str]:
@@ -69,10 +90,48 @@ class OptiplySink(RecordSink):
         Returns:
             The HTTP headers.
         """
-        return {
+        headers = {}
+        headers.update(self.authenticator.auth_headers or {})
+        headers.update({
             "Content-Type": "application/vnd.api+json",
             "Accept": "application/vnd.api+json"
-        }
+        })
+        return headers
+
+    def _get_error_message(self, response_text: str, status_code: int, url: str) -> str:
+        """Get a meaningful error message from response text."""
+        if not response_text or response_text.strip() in ['', 'null', 'None']:
+            return f"No error details provided (status {status_code})"
+        
+        # Try to parse JSON error response
+        try:
+            import json
+            error_data = json.loads(response_text)
+            if isinstance(error_data, dict):
+                if 'errors' in error_data and isinstance(error_data['errors'], list):
+                    error_messages = []
+                    for error in error_data['errors']:
+                        if isinstance(error, dict):
+                            if 'meta' in error and 'message' in error['meta']:
+                                error_messages.append(error['meta']['message'])
+                            elif 'detail' in error:
+                                error_messages.append(error['detail'])
+                            elif 'message' in error:
+                                error_messages.append(error['message'])
+                    if error_messages:
+                        return f"API Error: {'; '.join(error_messages)}"
+                elif 'message' in error_data:
+                    return f"API Error: {error_data['message']}"
+                elif 'error' in error_data:
+                    return f"API Error: {error_data['error']}"
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+        
+        # Fallback to raw response text if it's meaningful
+        if len(response_text.strip()) > 0:
+            return f"API Error: {response_text}"
+        else:
+            return f"No error details provided (status {status_code})"
 
     def validate_response(self, response: requests.Response) -> None:
         """Validate the response from the API.
@@ -85,15 +144,19 @@ class OptiplySink(RecordSink):
             RetriableAPIError: If the response indicates a retriable error.
         """
         if response.status_code >= 500:
-            raise RetriableAPIError(f"Server error: {response.text}")
+            error_msg = self._get_error_message(response.text, response.status_code, response.url)
+            raise RetriableAPIError(f"Server error ({response.status_code}): {error_msg}")
         elif response.status_code == 404:
-            logger.warning(f"Resource not found (404): {response.url}")
+            error_msg = self._get_error_message(response.text, response.status_code, response.url)
+            logger.warning(f"Resource not found (404): {response.url} - {error_msg}")
             return
         elif response.status_code == 401:
             # 401 errors are handled in _request method with token refresh
-            raise FatalAPIError(f"Authentication failed after token refresh: {response.text}")
+            error_msg = self._get_error_message(response.text, response.status_code, response.url)
+            raise FatalAPIError(f"Authentication failed after token refresh ({response.status_code}): {error_msg}")
         elif response.status_code >= 400:
-            raise FatalAPIError(f"Client error: {response.text}")
+            error_msg = self._get_error_message(response.text, response.status_code, response.url)
+            raise FatalAPIError(f"Client error ({response.status_code}): {error_msg}")
 
     @backoff.on_exception(
         backoff.expo,
@@ -106,7 +169,7 @@ class OptiplySink(RecordSink):
     ) -> requests.Response:
         """Make a request with automatic token refresh on 401 errors."""
         url = self.url(endpoint)
-        headers = {**self.http_headers(), **self.authenticator.auth_headers}
+        headers = self.http_headers()
 
         # First attempt
         response = requests.request(
@@ -121,11 +184,11 @@ class OptiplySink(RecordSink):
         if response.status_code == 401:
             logger.info("Received 401 error, attempting to refresh token and retry")
             try:
-                # Force token refresh using the authenticator method
-                self._authenticator.force_refresh()
+                # Handle 401 response by refreshing token
+                self.authenticator.handle_401_response()
                 
                 # Get fresh headers with new token
-                headers = {**self.http_headers(), **self.authenticator.auth_headers}
+                headers = self.http_headers()
                 
                 # Retry the request with new token
                 response = requests.request(
@@ -171,23 +234,67 @@ class OptiplySink(RecordSink):
             url = f"{url}?{query_string}"
         return url
 
-    def process_record(self, record: dict, context: dict) -> None:
-        """Process the record.
-
-        Args:
-            record: Individual record in the stream.
-            context: Stream partition or context dictionary.
-        """
-        # This method will be overridden by specific sink implementations
-        pass
-
-    def get_url(self, context: dict = None) -> str:
-        """Get the base URL for the API.
+    def request_api(self, http_method: str, endpoint: str = None, params: dict = {}, request_data: dict = None, headers: dict = {}) -> requests.Response:
+        """Make an API request with retry logic."""
+        import backoff
         
-        Args:
-            context: Optional context dictionary
+        @backoff.on_exception(backoff.expo, 
+                             (requests.exceptions.RequestException, ConnectionResetError),
+                             max_tries=3, max_time=30)
+        def _make_request():
+            # Use the url() method to properly include accountId and couplingId parameters
+            url = self.url(endpoint)
+            request_headers = self.http_headers().copy()
+            if headers:
+                request_headers.update(headers)
             
-        Returns:
-            The base URL
-        """
-        return self.base_url
+            self.logger.info(f"Making {http_method} request to: {endpoint}")
+            if request_data:
+                self.logger.info(f"REQUEST - endpoint: {endpoint}, request_body: {request_data}")
+            
+            response = requests.request(
+                method=http_method,
+                url=url,
+                json=request_data,
+                headers=request_headers,
+                timeout=30
+            )
+            
+            # Log response for debugging
+            self.logger.info(f"Response status: {response.status_code}")
+            if response.status_code >= 400:
+                # Use the same error message helper function
+                error_msg = self._get_error_message(response.text, response.status_code, url)
+                self.logger.error(f"API Error: {response.status_code} - {error_msg}")
+                # Log the request payload for server errors (500s)
+                if response.status_code >= 500:
+                    self.logger.error(f"Request payload that caused 500 error: {request_data}")
+                    self.logger.error(f"Request headers: {request_headers}")
+                    self.logger.error(f"Request URL: {url}")
+            
+            return response
+        
+        # Make the initial request
+        response = _make_request()
+        
+        # Handle 401 errors by refreshing token and retrying
+        if response.status_code == 401:
+            logger.info("Received 401 error in request_api, attempting to refresh token and retry")
+            try:
+                # Handle 401 response by refreshing token
+                self.authenticator.handle_401_response()
+                
+                # Retry the request with new token
+                response = _make_request()
+                logger.info("Successfully retried request after token refresh")
+                
+                # If we still get 401 after refresh, it's a fatal error
+                if response.status_code == 401:
+                    logger.error("Still getting 401 after token refresh - authentication failed")
+                    raise FatalAPIError(f"Authentication failed after token refresh: {response.text}")
+                    
+            except Exception as e:
+                logger.error(f"Failed to refresh token and retry: {str(e)}")
+                raise
+        
+        return response

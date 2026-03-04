@@ -1,4 +1,4 @@
-singer-sdk>=0.34.0
+target-hotglue>=0.0.16
 requests>=2.31.0
-backoff>=2.2.1
+backoff>=1.8.0,<2.0
 python-dateutil>=2.8.2 

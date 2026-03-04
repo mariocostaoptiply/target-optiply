@@ -6,7 +6,8 @@ import json
 import logging
 import os
 import requests
-from datetime import datetime, timedelta
+import backoff
+from datetime import datetime
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -16,115 +17,99 @@ class OptiplyAuthenticator:
 
     def __init__(
         self,
-        config: Dict[str, Any],
+        target,
         auth_endpoint: Optional[str] = None,
     ) -> None:
-        """Initialize authenticator.
-
-        Args:
-            config: Configuration dictionary containing credentials.
-            auth_endpoint: Optional custom auth endpoint.
-        """
-        self._config = config
+        """Initialize authenticator."""
+        self.target_name: str = target.name
+        self._config: Dict[str, Any] = target._config
         self._auth_endpoint = auth_endpoint or os.environ.get(
-            "optiply_dashboard_url", "https://dashboard.optiply.nl/api"
+            "optiply_dashboard_url", "https://dashboard.acceptance.optiply.com/api"
         ) + "/auth/oauth/token"
-        self._access_token = None
-        self._token_expires_at = None
-        self._refresh_token = None
+        self._target = target
 
     @property
-    def auth_headers(self) -> Dict[str, str]:
-        """Get authentication headers.
-
-        Returns:
-            Dictionary containing Authorization header with Bearer token.
-        """
+    def auth_headers(self) -> dict:
+        """Get authentication headers."""
         if not self.is_token_valid():
             self.update_access_token()
-        
-        return {
-            "Authorization": f"Bearer {self._access_token}"
-        }
+        result = {}
+        result["Authorization"] = f"Bearer {self._config.get('access_token')}"
+        return result
 
     @property
-    def oauth_request_body(self) -> Dict[str, str]:
-        """Get OAuth request body for password flow.
-
-        Returns:
-            Dictionary containing OAuth request parameters.
-        """
+    def oauth_request_body(self) -> dict:
+        """Define the OAuth request body for password flow."""
         return {
             "grant_type": "password",
             "username": self._config["username"],
             "password": self._config["password"],
             "client_id": self._config["client_id"],
-            "client_secret": self._config["client_secret"]
+            "client_secret": self._config["client_secret"],
         }
 
     def is_token_valid(self) -> bool:
-        """Check if the current access token is still valid.
-
-        Returns:
-            True if token is valid, False otherwise.
-        """
-        if not self._access_token:
+        """Check if the current access token is still valid."""
+        access_token = self._config.get("access_token")
+        now = round(datetime.utcnow().timestamp())
+        expires_in = self._config.get("expires_in")
+        if expires_in is not None:
+            expires_in = int(expires_in)
+        if not access_token:
             return False
-        
-        if not self._token_expires_at:
-            return False
-        
-        # Check if token expires within the next 2 minutes
-        now = datetime.utcnow()
-        return self._token_expires_at > (now + timedelta(minutes=2))
 
+        if not expires_in:
+            return False
+
+        return not ((expires_in - now) < 120)
+
+    @backoff.on_exception(backoff.expo, Exception, max_tries=3)
     def update_access_token(self) -> None:
         """Update the access token by making a request to the auth endpoint."""
-        logger.info("Starting token refresh process")
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        logger.info(f"OAuth request - endpoint: {self._auth_endpoint}, body: {self.oauth_request_body}")
         
-        try:
-            # Prepare Basic Auth headers
-            client_id = self._config["client_id"]
-            client_secret = self._config["client_secret"]
-            import base64
-            basic_auth = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
-            
-            headers = {
-                "Authorization": f"Basic {basic_auth}",
-                "Content-Type": "application/x-www-form-urlencoded"
-            }
-            
-            logger.info(f"Making token request to: {self._auth_endpoint}")
-            
-            # Make the token request
-            response = requests.post(
-                self._auth_endpoint,
-                data=self.oauth_request_body,
-                headers=headers,
-                timeout=30
-            )
-            
-            if response.status_code != 200:
-                raise Exception(f"Token request failed with status {response.status_code}: {response.text}")
-            
-            token_data = response.json()
-            
-            # Update token information
-            self._access_token = token_data["access_token"]
-            self._refresh_token = token_data.get("refresh_token")
-            
-            # Calculate expiration time
-            expires_in = token_data.get("expires_in", 3600)  # Default to 1 hour
-            self._token_expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
-            
-            logger.info("Successfully updated access token")
-            
-        except Exception as e:
-            logger.error(f"Failed to update access token: {str(e)}")
-            raise
+        # Prepare Basic Auth headers
+        import base64
+        client_id = self._config["client_id"]
+        client_secret = self._config["client_secret"]
+        basic_auth = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        headers["Authorization"] = f"Basic {basic_auth}"
+        
+        token_response = requests.post(
+            self._auth_endpoint, data=self.oauth_request_body, headers=headers
+        )
 
-    def force_refresh(self) -> None:
-        """Force a token refresh regardless of current token validity."""
-        self._access_token = None
-        self._token_expires_at = None
+        try:
+            if (
+                token_response.json().get("error_description")
+                == "Rate limit exceeded: access_token not expired"
+            ):
+                return None
+        except Exception as e:
+            raise Exception(f"Failed converting response to a json, OAuth response: {token_response.text}")
+
+        try:
+            token_response.raise_for_status()
+            logger.info("OAuth authorization attempt was successful.")
+        except Exception as ex:
+            raise RuntimeError(
+                f"Failed OAuth login, response was '{token_response.json()}'. {ex}"
+            )
+        
+        token_json = token_response.json()
+        logger.info(f"Latest refresh token: {token_json['refresh_token']}")
+        
+        self._config["access_token"] = token_json["access_token"]
+        self._config["refresh_token"] = token_json["refresh_token"]
+        now = round(datetime.utcnow().timestamp())
+        self._config["expires_in"] = int(token_json["expires_in"]) + now
+
+        with open(self._target.config_file, "w") as outfile:
+            json.dump(self._config, outfile, indent=4)
+
+    def handle_401_response(self) -> None:
+        """Handle 401 Unauthorized response by refreshing the token."""
+        logger.info("Received 401 Unauthorized response, refreshing token...")
         self.update_access_token()
+        logger.info("Token refreshed after 401 response")
