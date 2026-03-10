@@ -68,6 +68,8 @@ class TargetOptiply(TargetHotglue):
     ]
     MAX_PARALLELISM = 10
     name = "target-optiply"
+    EXTERNAL_ID_KEY = "remoteId" # This is the key that will be used to resolve the external ID
+    GLOBAL_PRIMARY_KEY = "optiply_id"
 
     def get_sink_class(self, stream_name: str):
         """Get sink class for the given stream name."""

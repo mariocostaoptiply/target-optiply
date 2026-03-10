@@ -60,27 +60,12 @@ class OptiplySink(HotglueSink):
             The authenticator instance.
         """
         if self._authenticator is None:
-            # Get the config from target
             full_config = self._target._config
-            self.logger.info(f"Full config keys: {list(full_config.keys())}")
-            self.logger.info(f"Full config type: {type(full_config)}")
-            
-            # Use top-level config for authentication
-            auth_config = {
-                "client_id": full_config.get("client_id"),
-                "client_secret": full_config.get("client_secret"),
-                "username": full_config.get("username"),
-                "password": full_config.get("password"),
-                "access_token": full_config.get("access_token")
-            }
-            self.logger.info("✅ USING top-level config for authentication")
-            
-            # Log the final auth config being used
-            self.logger.info(f"Final auth config keys: {list(auth_config.keys())}")
-            self.logger.info(f"Final auth config client_id: {auth_config.get('client_id', 'NOT_FOUND')}")
-            self.logger.info(f"Final auth config client_secret: {auth_config.get('client_secret', 'NOT_FOUND')[:8]}...{auth_config.get('client_secret', 'NOT_FOUND')[-4:] if len(auth_config.get('client_secret', '')) > 12 else '***'}")
-            
-            # Pass the target to the authenticator
+            self.logger.debug(f"Full config keys: {list(full_config.keys())}")
+            self.logger.debug(f"Final auth config client_id: {full_config.get('client_id', 'NOT_FOUND')}")
+            client_secret = full_config.get('client_secret', '')
+            masked_secret = client_secret[:8] + '...' + client_secret[-4:] if len(client_secret) > 12 else '***'
+            self.logger.debug(f"Final auth config client_secret: {masked_secret}")
             self._authenticator = OptiplyAuthenticator(self._target)
         return self._authenticator
 
@@ -238,20 +223,17 @@ class OptiplySink(HotglueSink):
         """Make an API request with retry logic."""
         import backoff
         
-        @backoff.on_exception(backoff.expo, 
+        @backoff.on_exception(backoff.expo,
                              (requests.exceptions.RequestException, ConnectionResetError),
                              max_tries=3, max_time=30)
         def _make_request():
-            # Use the url() method to properly include accountId and couplingId parameters
             url = self.url(endpoint)
             request_headers = self.http_headers().copy()
             if headers:
                 request_headers.update(headers)
-            
-            self.logger.info(f"Making {http_method} request to: {endpoint}")
-            if request_data:
-                self.logger.info(f"REQUEST - endpoint: {endpoint}, request_body: {request_data}")
-            
+
+            self.logger.info(f"Request: {http_method} /{endpoint} | Payload: {request_data}")
+
             response = requests.request(
                 method=http_method,
                 url=url,
@@ -259,19 +241,15 @@ class OptiplySink(HotglueSink):
                 headers=request_headers,
                 timeout=30
             )
-            
-            # Log response for debugging
-            self.logger.info(f"Response status: {response.status_code}")
+
             if response.status_code >= 400:
-                # Use the same error message helper function
                 error_msg = self._get_error_message(response.text, response.status_code, url)
-                self.logger.error(f"API Error: {response.status_code} - {error_msg}")
-                # Log the request payload for server errors (500s)
+                self.logger.error(f"Request Status: {response.status_code} | Error: {error_msg}")
                 if response.status_code >= 500:
-                    self.logger.error(f"Request payload that caused 500 error: {request_data}")
-                    self.logger.error(f"Request headers: {request_headers}")
-                    self.logger.error(f"Request URL: {url}")
-            
+                    self.logger.error(f"Request URL: {url} | Payload: {request_data}")
+            else:
+                self.logger.info(f"Request Status: {response.status_code}")
+
             return response
         
         # Make the initial request

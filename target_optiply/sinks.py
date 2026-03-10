@@ -77,9 +77,6 @@ class BaseOptiplySink(OptiplySink):
             # Set http_method based on presence of id field
             http_method = "PATCH" if record_id else "POST"
             
-            # Log record processing
-            self.logger.info(f"Processing record for {self.stream_name} (ID: {record_id})")
-
             # For POST requests, check mandatory fields
             if http_method == "POST":
                 mandatory_fields = self.get_mandatory_fields()
@@ -104,8 +101,6 @@ class BaseOptiplySink(OptiplySink):
             else:
                 endpoint = self.endpoint
                 
-            self.logger.info(f"Making {http_method} request to: {endpoint}")
-
             # Make the request
             response = self.request_api(
                 http_method=http_method,
@@ -113,9 +108,6 @@ class BaseOptiplySink(OptiplySink):
                 request_data=record
             )
             
-            self.logger.info(f"Response status: {response.status_code}")
-            self.logger.info(f"Response body: {response.text}")
-
             # Handle response
             if response.status_code == 404:
                 # Get meaningful error message from response
@@ -464,9 +456,6 @@ class SupplierProductSink(BaseOptiplySink):
         
         # Remove any None values that might cause issues
         attributes = {k: v for k, v in attributes.items() if v is not None}
-        
-        # Log the final attributes for debugging
-        self.logger.info(f"Final attributes for {self.stream_name}: {attributes}")
 
     def get_mandatory_fields(self) -> List[str]:
         """Get the list of mandatory fields for this sink.

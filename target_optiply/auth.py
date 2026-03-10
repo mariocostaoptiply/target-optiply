@@ -51,17 +51,16 @@ class OptiplyAuthenticator:
     def is_token_valid(self) -> bool:
         """Check if the current access token is still valid."""
         access_token = self._config.get("access_token")
-        now = round(datetime.utcnow().timestamp())
-        expires_in = self._config.get("expires_in")
-        if expires_in is not None:
-            expires_in = int(expires_in)
         if not access_token:
             return False
 
+        expires_in = self._config.get("expires_in")
         if not expires_in:
-            return False
+            # No expiry info but token exists — assume valid, 401 handler will refresh if needed
+            return True
 
-        return not ((expires_in - now) < 120)
+        now = round(datetime.utcnow().timestamp())
+        return not ((int(expires_in) - now) < 120)
 
     @backoff.on_exception(backoff.expo, Exception, max_tries=3)
     def update_access_token(self) -> None:
